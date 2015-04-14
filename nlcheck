@@ -1,0 +1,840 @@
+#! /usr/bin/perl
+
+require "/var/fnet/rc/nlcheck.conf";
+
+use POSIX;
+
+if ($checkhold)
+{
+	eval "use DB_File;";
+	if ($@)
+	{
+		eval "use GDBM_File;";
+		if ($@)
+		{
+			print STDERR "Can't use DB_File and GDBM_File, hold time check turned off\n";
+			$checkhold = 0;
+		} else
+		{	$checkhold = "GDMB_File";
+			$openmode = &GDBM_READER | &GDBM_WRITER;
+			$openmodec = &GDBM_READER | &GDBM_WRITER | &GDBM_WRCREAT;
+		}
+	} else
+	{	$checkhold = "DB_File";
+		$openmode = &O_RDWR;
+		$openmodec = &O_RDWR | &O_CREAT;
+	}
+}
+
+if ($resolve || $checkmx)
+{
+	eval "use Socket;";
+	if ($@)
+	{
+		print STDERR "Can't use Socket, resolve and checkmx disabled\n";
+		$resolve = $checkmx = 0;
+	} elsif ($checkmx)
+	{
+		eval "use Net::DNS;";
+		if ($@)
+		{	print STDERR "Can't use NET::DNS, checkmx disabled\n";
+			$checkmx = 0;
+		}
+	}
+}
+
+if ($checkmx)
+{	eval '
+sub checkdomain
+{	my ($domain) = @_;
+	my ($res, @mxlist, @res);
+
+	if (@res = gethostbyname($host))
+	{	return 1; # host exists
+	}
+	if ($? == 2)
+	{	return 2; # nameserver fail
+	}
+
+	$res = new Net::DNS::Resolver;
+	@mxlist = mx($res, $domain);
+	return 1 if @mxlist;
+	$err = $res->errorstring;
+	if ($err eq "SERVFAIL" ||
+	    $err eq "REFUSED" ||
+	    $err eq "NOTAUTH" ||
+	    $err eq "NOTZONE" ||
+	    $err eq "query timed out")
+	{	return 2; # nameserver fail
+	}
+	return 0;	# no MX, no addr
+}';
+} else
+{	eval 'sub checkdomain { return 1; }';
+}
+
+unless ($resolve)
+{	eval 'sub gethostbyname { return 1; }';
+}
+
+$net = 0;
+$nodes = 0;
+$crlf = 0;
+$line = 0;
+$errors = $warnings = 0;
+$lastnode = $lasthub = 0;
+$warnorder = $warnmodem = $warnzmh = $warnresolve = $warnemail = 0;
+$warnnpk = $warnnec = 0;
+$firstline = 1;
+$netdomain = $defdomain;
+
+unless ($ARGV[0] =~ /^(?:.*\/)?net_(\d+)\.\d\d\d$/i)
+{	print "Usage: $0 <segment> [check]\n";
+	exit(3);
+}
+$netfile = $1;
+
+@crc16tab = (
+  0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
+  0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
+  0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
+  0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE,
+  0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485,
+  0xA56A, 0xB54B, 0x8528, 0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D,
+  0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4,
+  0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC,
+  0x48C4, 0x58E5, 0x6886, 0x78A7, 0x0840, 0x1861, 0x2802, 0x3823,
+  0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B,
+  0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12,
+  0xDBFD, 0xCBDC, 0xFBBF, 0xEB9E, 0x9B79, 0x8B58, 0xBB3B, 0xAB1A,
+  0x6CA6, 0x7C87, 0x4CE4, 0x5CC5, 0x2C22, 0x3C03, 0x0C60, 0x1C41,
+  0xEDAE, 0xFD8F, 0xCDEC, 0xDDCD, 0xAD2A, 0xBD0B, 0x8D68, 0x9D49,
+  0x7E97, 0x6EB6, 0x5ED5, 0x4EF4, 0x3E13, 0x2E32, 0x1E51, 0x0E70,
+  0xFF9F, 0xEFBE, 0xDFDD, 0xCFFC, 0xBF1B, 0xAF3A, 0x9F59, 0x8F78,
+  0x9188, 0x81A9, 0xB1CA, 0xA1EB, 0xD10C, 0xC12D, 0xF14E, 0xE16F,
+  0x1080, 0x00A1, 0x30C2, 0x20E3, 0x5004, 0x4025, 0x7046, 0x6067,
+  0x83B9, 0x9398, 0xA3FB, 0xB3DA, 0xC33D, 0xD31C, 0xE37F, 0xF35E,
+  0x02B1, 0x1290, 0x22F3, 0x32D2, 0x4235, 0x5214, 0x6277, 0x7256,
+  0xB5EA, 0xA5CB, 0x95A8, 0x8589, 0xF56E, 0xE54F, 0xD52C, 0xC50D,
+  0x34E2, 0x24C3, 0x14A0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
+  0xA7DB, 0xB7FA, 0x8799, 0x97B8, 0xE75F, 0xF77E, 0xC71D, 0xD73C,
+  0x26D3, 0x36F2, 0x0691, 0x16B0, 0x6657, 0x7676, 0x4615, 0x5634,
+  0xD94C, 0xC96D, 0xF90E, 0xE92F, 0x99C8, 0x89E9, 0xB98A, 0xA9AB,
+  0x5844, 0x4865, 0x7806, 0x6827, 0x18C0, 0x08E1, 0x3882, 0x28A3,
+  0xCB7D, 0xDB5C, 0xEB3F, 0xFB1E, 0x8BF9, 0x9BD8, 0xABBB, 0xBB9A,
+  0x4A75, 0x5A54, 0x6A37, 0x7A16, 0x0AF1, 0x1AD0, 0x2AB3, 0x3A92,
+  0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9,
+  0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
+  0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8,
+  0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
+);
+
+@twits = split(/\s*(?:#[^\n]*)?\n\s*/, $twits);
+
+open(F, '<:raw', $ARGV[0]) || die "Can't open $ARGV[0]: $!\n";
+$newseg = '';
+
+while (<F>)
+{
+	$line++;
+	last if $_ eq "\x1a"; # EOF
+	if ($firstline && /^;A .+ Node[lL]ist(?: Segment)? for .* -- Day number \d+ : (\d\d\d\d\d)\s*$/s)
+	{	$origcrc = $1;
+		$origcrc =~ s/^0+//;
+		$crc = 0;
+	} elsif (defined($origcrc))
+	{	foreach $char (split(//, $_))
+		{	$crc = (($crc << 8) ^ $crc16tab[($crc >> 8) ^ ord($char)]) & 0xffff;
+		}
+	}
+	$firstline = 0;
+	unless (/\r\n$/s)
+	{
+		if (/\n$/s)
+		{	warning("unix line terminators\n") unless $crlf;
+			$crlf = 1;
+			s/\n$/\r\n/s;
+			$changed = 1;
+		} else
+		{	warning("line $line: no EOL\n");
+			$_ .= "\r\n";
+			$changed = 1;
+		}
+	}
+	if (/^\s+$/)
+	{	warning("empty line $line skipped\n");
+		$changed = 1;
+		next;
+	}
+	if (/^;/)
+	{	if (/^;W\s+/)
+		{	if (/^;W\s+([-+])order\s+$/)
+			{	$warnorder = ($1 eq "-") ? 2 : 0;
+			} elsif (/^;W\s+([-+])modem\s+$/)
+			{	$warnmodem = ($1 eq "-") ? 2 : 0;
+			} elsif (/^;W\s+([-+])zmh\s+$/)
+			{	$warnzmh = ($1 eq "-") ? 2 : 0;
+			} elsif (/^;W\s+([-+])resolve\s+$/)
+			{	$warnresolve = ($1 eq "-") ? 2 : 0;
+			} elsif (/^;W\s+([-+])email\s+$/)
+			{	$warnemail = ($1 eq "-") ? 2 : 0;
+			} elsif (/^;W\s+([-+])npk\s+$/)
+			{	$warnnpk = ($1 eq "-") ? 1 : 0;
+			} elsif (/^;W\s+([-+])nec\s+$/)
+			{	$warnnec = ($1 eq "-") ? 1 : 0;
+			} else
+			{	warning("unknown warning directive ignored in line $line:\n$_");
+			}
+			$changed=1;
+		} elsif (/^;[SUFA]?( .*)?\s*$/)
+		{	$newseg .= $_;
+		} else
+		{	warning("FTS-5000 incompartible comment removed in line $line:\n$_");
+			$changed = 1;
+		}
+		next;
+	}
+	$warnorder-- if $warnorder;
+	$warnmodem-- if $warnmodem;
+	$warnzmh-- if $warnzmh;
+	$warnresolve-- if $warnresolve;
+	$warnemail-- if $warnemail;
+	if (/^(.*\S)\s+\r\n$/s)
+	{	$new_ = "$1\r\n";
+		warning("Trailing space removed in line $line:\n$_");
+		$_ = $new_;
+		$changed = 1;
+	}
+	if (/\s.*\r\n$/)
+	{	error("space in line $line:\n$_");
+		next;
+	}
+	if (/,(\s*)$/s)
+	{	$new_ = "$`$1";
+		warning("Trailing comma removed in line $line:\n$_");
+		$_ = $new_;
+		$changed = 1;
+	}
+	unless (/^([^,]*),([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^,]+)(?:,(.*))?\r\n$/)
+	{	error("can't parse line $line:\n$_");
+		next;
+	}
+	$lchanged = 0;
+	($keyword, $node, $system, $location, $sysop, $phone, $speed, $flags) = 
+		($1, $2, $3, $4, $5, $6, $7, $8);
+	unless ($keyword =~ /^(Host|Hub|Hold|Down|Pvt|)$/)
+	{	error("unknown keyword $keyword in line $line:\n$_");
+		next;
+	}
+	unless ($node =~ /^\d+$/ && $node > 0 && $node < 32768)
+	{	error("incorrect node number in line $line:\n$_");
+		next;
+	}
+	foreach $twit (@twits)
+	{	if ($twit eq "$net/$node")
+		{	error("Node 2:$net/$node was excommunicated\n");
+			next;
+		}
+	}
+#	unless ($system =~ /^[a-zA-Z0-9_\.\'\[\]]+$/)
+#	{	warning("bad character in nodename field in line $line:\n$_");
+#	}
+#	unless ($location =~ /^[a-zA-Z_]+$/)
+#	{	warning("bad character in location field in line $line:\n$_");
+#	}
+#	unless ($sysop =~ /^[a-zA-Z0-9_]+$/)
+#	{	warning("bad character in sysop field in line $line:\n$_");
+#	}
+	unless ($phone =~ /^(\d[0-9\-]+\d|-Unpublished-)$/)
+	{	error("bad phone number in line $line:\n$_");
+		next;
+	}
+	unless ($speed =~ /^$speeds$/)
+	{	error("incorrect speed \"$speed\" in line $line:\n$_");
+		next;
+	}	
+	if ($keyword eq "Host" && $net)
+	{	error("second host in line $line:\n$_");
+	}
+	if ($keyword ne "Host" && !$net)
+	{	error("no host before line $line:\n$_");
+	}
+	if ($keyword eq "Host")
+	{	$net = $node;
+		$node = 0;
+		if ($net ne $netfile)
+		{	error("host $net not equal with filename $netfile\n");
+		}
+		unless ($phoneprefix{$net})
+		{	error("unknown net $net\n");
+		}
+		$phoneprefix = $phoneprefix{$net};
+		$requiredprefix = $requiredprefix{$net}
+		    if defined($requiredprefix{$net});
+		$phonelen = $phonelen{$net} if defined($phonelen{$net});
+		$ncname = $& if $nc{$net} =~ /^\S+/;
+		$wrongnc = $sysop if $ncname ne $sysop;
+		$ncnode = 0;
+	}
+	if ($node{$node})
+	{	error("duplicate nodenumber $node in line $line:\n$_");
+	} else
+	{	$node{$node} = 1;
+	}
+	if ($keyword ne "Host" && $keyword ne "Hub" && $phone ne "-Unpublished-")
+	{	if (defined($phone{$phone}))
+		{	error("duplicate phone $phone, nodes 2:$net/$phone{$phone} and 2:$net/$node, line $line\n");
+		} elsif ($phone !~ /^$ipprefix/)
+		{	$phone{$phone} = $node;
+		}
+	}
+	if ($phone =~ /\d/ && $phone !~ /^$ipprefix/)
+	{
+		$ph = $phone;
+		$ph =~ s/\D//g;
+		if (length($ph) != $phonelen)
+		{	error("incorrect phone length in line $line (must be $phonelen, real ".length($ph)."):\n$_");
+		}
+		if ($phone !~ /^$requiredprefix/)
+		{	error("incorrect phone prefix in line $line:\n$_");
+		}
+		elsif ($net && $phone !~ /^$phoneprefix$/)
+		{	warning("incorrect phone prefix in line $line:\n$_");
+		}
+	}
+	$keyword{$node} = $keyword;
+	if ($flags =~ /,U$/)
+	{	$flags = $`;
+		$lchanged = 1;
+		warning("Senseless U-flag removed in line $line:\n$_");
+	}
+	# Txy is not user-flags anymore
+	if ($flags =~ /^(.*?,)?U(.*,)?(T[a-zA-Z][a-zA-Z])(,.*)?$/)
+	{	$flags = "$1$3,U,$2$4";
+		warning("Flag U$3 changed to $3 in line $line:\n$_");
+		$flags =~ s/,+/,/g;
+		$flags =~ s/,$//;
+		$flags =~ s/,U$//;
+		$lchanged = 1;
+	}
+	$userflag = 0;
+	%flag = ();
+	@f = split(/,/, $flags);
+	$fchanged = 0;
+	$wasxflag = 0;
+	$wasemail = 0;
+	$ipnode = 0;
+	undef($hostdom);
+	foreach $f (@f)
+	{
+		if ($f =~ /^[A-Z0-9]*[a-z]/)
+		{	unless ($f =~ /^U?T/)
+			{	if ($f =~ /^([A-Za-z0-9]+)/)
+				{	($f1, $f2) = ($&, $');
+					$f1 =~ tr/a-z/A-Z/;
+					warning("flag $f changed to $f1$f2 in line $line:\n$_");
+					$f="$f1$f2";
+					$fchanged=1;
+				}
+			}
+		}
+		$flag = $f;
+		if ($flag =~ /^U/)
+		{	error("two U flags in one line $line:\n$_")
+				if $userflag;
+			$userflag = 1;
+			$flag = $';
+			next if $flag eq "";
+		}
+		$flag = "U$flag" if $userflag;
+		$correctflag = 0;
+		foreach $lflag (@flags)
+		{	$correctflag = 1 if $flag =~ /^$lflag$/;
+		}
+		if ($correctflag == 0)
+		{	error("unknown flag $flag in line $line:\n$_");
+		}
+		if ($flag =~ /^I(MI|SE|TX|UC|EM)/ && !$warnemail)
+		{	if ($flag !~ /:/ && !$wasemail)
+			{	warning("No email in $flag flag specified in line $line:\n$_");
+			} elsif ($flag =~ /:/)
+			{	$wasemail = 1;
+				$email = $';
+				if ($email !~ /^[a-zA-Z0-9_\-\.\+\!]+\@([a-zA-Z][a-zA-Z0-9\-\._]*\.[a-zA-Z]+)$/)
+				{	warning("Incorrect email address in flag $flag in line $line:\n$_");
+				} elsif (!$warnresolve && $checkmx)
+				{	if (checkdomain($1) == 0)
+					{	warning("Bad email address in flag $flag in line $line:\n$_");
+					}
+				}
+			}
+		}
+		if ($flag =~ /:/)
+		{	($flag, $optflag) = ($`, $');
+		} else
+		{	$optflag = 1;
+		}
+		if ($flag =~ /^UDO[M1234]/ && $optflag =~ /^([a-z0-9][-a-z0-9.]*[a-z]).?$/i)
+		{	$hostdom = getdom($flag, $1, $net);
+		}
+		$ipnode = 1 if $flag =~ /^($ipflags)$/;
+		if ($flag =~ /^T([a-xA-X])([a-xA-X])$/)
+		{	($startc, $endc) = ($1, $2);
+			$worktime = "0${1}00-0${2}00";
+			$worktime =~ s/([a-x])00/${1}30/g;
+			$worktime =~ tr/a-x/A-X/;
+			$worktime =~ tr/K-T/0-9/;
+			$worktime =~ s/0(\d\d\d)/1$1/g;
+			$worktime =~ tr/U-X/0-3/;
+			$worktime =~ s/0(\d\d\d)/2$1/g;
+			$worktime =~ tr/A-J/0-9/;
+			$start="0000"; $end="2330";
+			($start, $end) = ($1, $2) if $worktime =~ /^(\d\d\d\d)-(\d\d\d\d)$/;
+			$start =~ s/^0+//;
+			$end =~ s/^0+//;
+			$nozmh = 0;
+			if ($start <= $end)
+			{	$nozmh = 1 if ($start > 230 || $end < 330);
+			} else
+			{	$nozmh = 1 if ($start > 230 && $end < 330);
+			}
+			if ($start == $end)
+			{	warning("Bad flag $flag (should be CM?) in line $line:\n$_");
+			} elsif ($nozmh && !$warnzmh && $phone !~ /^$ipprefix/ && $phone =~ /\d/)
+			{	if ($startc =~ /^[dD]$/ && $endc !~ /^[cD]$/)
+				{	$startc = 'c';
+				}
+				if ($endc =~ /^[cD]$/ && $startc !~ /^[dD]$/)
+				{	$endc = 'd';
+				}
+				$proptime = "T$startc$endc";
+				$proptime = "CM" if $flag =~ /^T[dD][cD]$/;
+				warning("Flag $flag (worktime $worktime GMT) does not cover ZMH" . ($proptime eq $flag ? "" : " (should be $proptime?)") . " in line $line:\n$_");
+			}
+			$flag = "T";
+		}
+		if (defined($flag{$flag}))
+		{	error("Two $flag flags in line $line:\n$_");
+		} else
+		{	$flag{$flag} = $optflag;
+			if ($flag =~ /^X[ABCPRWX]$/)
+			{	if ($wasxflag++ == 1)
+				{	warning("Two X-flags in line $line:\n$_");
+				}
+			}
+		}
+		if (($flag eq "LO") && !$userflag && ($node == 0))
+		{	warning("Host can't has LO flag\n");
+		}
+	}
+	if ($fchanged)
+	{	$flags = join(',', @f);
+		$lchanged = 1;
+	}
+	if ($phone =~ /^$ipprefix/ && !$flag{"IBN"})
+	{	warning("IP phone prefix $ipprefix without IBN flag in line $line:\n$_");
+	}
+	foreach $flag (keys %implies)
+	{	next unless $flag{$flag};
+		foreach $impflag (split(/\s+/, $implies{$flag}))
+		{	next unless $flag{$impflag};
+			error("$flag implies $impflag in line $line:\n$_");
+		}
+	}
+	foreach $flag (keys %implies)
+	{	next unless $flag{$flag};
+		foreach $impflag (split(/\s+/, $implies{$flag}))
+		{	$flag{$impflag} = 1;
+		}
+	}
+	$ufchanged = 0;
+	if ($flag{"UREC"} && "$net/$node" ne $rec)
+	{	warning("Unapproved UREC flag removed in line $line:\n$_");
+		$ufchanged=1;
+		# UREC -> U   U,REC -> U  U,ASD,REC -> U,ASD  UQWE,REC -> Uqwe
+		# UREC,ASD -> UASD   U,ASD,REC,QWE -> U,ASD,QWE
+		$flags =~ s/^(.*,)?U(?:(.*[^,]),)?REC(,.*)?$/${1}U$2$3/;
+	}
+	if ($flag{"URPK"} && (!defined($rpk) || "$net/$node" ne $rpk))
+	{	warning("Unapproved URPK flag removed in line $line:\n$_");
+		$ufchanged = 1;
+		$flags =~ s/^(.*,)?U(?:(.*[^,]),)?RPK(,.*)?$/${1}U$2$3/;
+		$flags =~ s/,$//;
+	}
+	#if ($flag{"CM"} && $keyword eq "Pvt")
+	#{	warning("CM flag for Pvt-node in line $line:\n$_");
+	#} elsif ($flag{"UT"} && $keyword eq "Pvt")
+	#{	warning("UT flag for Pvt-node in line $line:\n$_");
+	#}
+	if ($flag{"UNC"})
+	{	if ($keyword eq "Host")
+		{	warning("Redundant flag UNC for host removed in line $line:\n$_");
+			$ufchanged = 1;
+			$flags =~ s/^(.*,)?U(.*,)?NC(?:,(.*))?$/${1}U$2$3/;
+			$flags =~ s/,$//;
+		} elsif ($wasunc)
+		{	error("Second UNC flags in the segment in line $line:\n$_");
+		} elsif ($keyword =~ /^(Hold|Down|Pvt)$/)
+		{	error("$keyword node cannot has UNC flag, line $line:\n$_");
+		} else
+		{	$wasunc = 1;
+			if ($ncname ne $sysop)
+			{	error("Unapproved NC: expected $ncname, found $sysop $net/$node in line $line:\n$_");
+			} else
+			{	$ncnode = $node;
+			}
+			undef($wrongnc);
+		}
+	}
+	$flags =~ s/,U$//;
+	if ($flag{"UNPK"})
+	{	if ($wasnpk)
+		{	error("Second UNPK flag in the segment in line $line:\n$_");
+		} else
+		{	$wasnpk = 1;
+		}
+	}
+	if ($flag{"UNEC"})
+	{	if ($wasnec)
+		{	error("Second UNEC flag in the segment in line $line:\n$_");
+		} else
+		{	$wasnec = 1;
+		}
+	}
+	if ("$net/$node" eq $rec && !$flag{"UREC"})
+	{	warning("Expected UREC flag for node $net/$node in line $line:\n$_");
+	}
+	if (defined($rpk) && "$net/$node" eq $rpk && !$flag{"UREC"})
+	{	warning("Expected URPK flag for node $net/$node in line $line:\n$_");
+	}
+	if ($ufchanged)
+	{	$flags =~ s/,U,?$//;
+		$lchanged = 1;
+	}
+	if ($speed >= 28800 && !$flag{"V34"} && !$warnmodem)
+	{	warning("Speed $speed without V34 in line $line:\n$_");
+	}
+	unless ($warnmodem)
+	{	foreach $flag (keys %softimplies)
+		{	next unless $flag{$flag};
+			foreach $impflag (split(/\s+/, $softimplies{$flag}))
+			{	next if $flag{$impflag};
+				warning("$flag without $impflag in line $line:\n$_");
+			}
+		}
+	}
+	if ($keyword eq "Pvt" && $flag{"IBN"})
+	{	#$phone = "00-00-000000";
+		$keyword = "";
+		$lchanged = 1;
+		warning("Prefix Pvt removed for IP-node $net/$node in line $line:\n$_");
+	}
+	if ($phone ne "-Unpublished-" && $keyword eq "Pvt")
+	{	warning("phone changed to unpublished for pvt-node in line $line:\n$_");
+		$phone = "-Unpublished-";
+		$lchanged = 1;
+	}
+	if ($keyword eq "Host")
+	{	if (defined($hostdom))
+		{	$netdomain = $hostdom;
+		} elsif ($regdom =~ /^U?(DO[M1234]):([a-z0-9][-a-z0-9.]*[a-z]).?$/i)
+		{	$netdomain = getdom("U$1", $2, $net);
+		} else
+		{	$netdomain = getdom("UDO4", "binkp.net", $net);
+		}
+	}
+	if ($ipnode && $resolve && !$warnresolve)
+	{	if ($flag{"INA"} =~ /\./)
+		{	$host = $flag{"INA"};
+		} elsif ($phone =~ /^000-(\d+)-(\d+)-(\d+)-(\d+)$/ && "$1$2$3$4" =~ /[1-9]/)
+		{	$host = $phone;
+			$host =~ s/^000-//;
+			$host =~ s/-/./g;
+		} elsif ($system =~ /^[a-z][a-z0-9\.\-]*\.(net|com|org|ua|ru|su|tv|md|to|biz|nu|int|tel)$/i || $system =~ /^\d+\.\d+\.\d+\.\d+$/)
+		{	$host = $system;
+		} else
+		{	$hostdom = $netdomain if !defined($hostdom);
+			$host = "f$node.$hostdom.";
+		}
+		# check resolving
+		unless (gethostbyname($host))
+		{	if ($? != 2)
+			{	$host =~ s/z2\.fidonet\.net\./z2.fidonet.net/;
+				warning("IP flag, but host $host does not exist in line $line:\n$_");
+			}
+		}
+	}
+	$nodes++;
+	if ($keyword eq "Host")
+	{	$lastnode = $lasthub = 0;
+		$node = $net;
+	} elsif ($keyword eq "Hub")
+	{	if ($node < $lasthub)
+		{	warning("hubnumbers are not in ascending order, line $line\n") unless $warnorder;
+		}
+		$lastnode = 0;
+		$lasthub = $node;
+	} else
+	{	if ($node < $lastnode)
+		{	warning("nodenumbers are not in ascending order, line $line\n") unless $warnorder;
+		}
+		$lastnode = $node;
+	}
+	if ($lchanged)
+	{	$_ = join(',', ($keyword, $node, $system, $location, $sysop, $phone, $speed, $flags));
+		$_ .= "\r\n";
+	}
+	if ($maxlinelen && length($_) > $maxlinelen - 2)
+	{	error("line $line too long ($maxlinelen max):\n$_");
+	}
+	$newseg .= $_;
+}
+close(F);
+
+if (defined($wrongnc))
+{	error("Unapproved NC: expected $ncname, found $wrongnc\n");
+}
+
+if (!$wasnec && !$warnnec)
+{	warning("No UNEC flag in the segment\n");
+}
+
+if (!$wasnpk && !$warnnpk)
+{	warning("No UNPK flag in the segment\n");
+}
+
+if (defined($origcrc) && $crc != $origcrc)
+{	error(sprintf("CRC check failed: specified %05d, calculated %05d\n", $origcrc, $crc));
+}
+
+$curtime = time();
+# segtime = 1:00 AM of Friday
+($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = localtime($curtime - 3600);
+$segtime = $curtime + 24 * 3600 * (1 + (11 - $wday) % 7);
+($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = localtime($segtime - 3600);
+$segtime -= $hour * 3600 + $min * 60 + $sec;
+
+if ($checkhold)
+{	unless (tie(%holddb, $checkhold, $holddb, $openmode, 0644) ||
+	        tie(%holddb, $checkhold, $holddb, $openmodec, 0644))
+	{	print STDERR "Can't open $holddb: $!\n";
+		$checkhold = 0;
+	}
+}
+if ($checkhold)
+{	foreach $node (keys %keyword)
+	{	if ($keyword{$node} eq "Hold")
+		{	if ($holddb{"$net/$node"} =~ /^Hold /)
+			{	if ($segtime - $' >= 24 * 60 * 60 * 8)
+				{	warning("More then two weeks hold for node 2:$net/$node\n");
+				}
+			} elsif (!$errors && !$checkonly)
+			{	$holddb{"$net/$node"} = "Hold $segtime";
+			}
+		} elsif ($keyword{$node} eq "Down")
+		{	if ($holddb{"$net/$node"} =~ /^Down /)
+			{	if ($segtime - $' >= 24 * 60 * 60 * 8)
+				{	warning("More then two weeks down for node 2:$net/$node\n");
+				}
+			} elsif (!$errors && !$checkonly)
+			{	$holddb{"$net/$node"} = "Down $segtime";
+			}
+		} elsif (!$errors && !$checkonly)
+		{	delete($holddb{"$net/$node"});
+		}
+	}
+	if (!$errors && !$checkonly)
+	{	foreach (keys %holddb)
+		{	next unless /\//;
+			next unless $` == $net;
+			delete($holddb{$_}) if !defined($keyword{$'});
+		}
+	}
+	untie %holddb;
+}
+
+$out .= "\nDone, $warnings warnings, $errors errors, $nodes nodes\n";
+$out .= ($errors ? "FAILED" : ("OK" . (defined($origcrc) ? " (crc check passed)" : ""))) . "\n";
+
+if ($checkonly || $ARGV[1] =~ /^check$/i)
+{
+	print $out;
+	exit($errors ? 1 : 0);
+}
+
+$segname = $ARGV[0];
+$segname =~ s/^.*\/(net_\d+\.\d\d\d)/$1/i;
+$newname = $segname;
+$newname =~ tr/A-Z/a-z/;
+if (!$errors)
+{	# check $yday range (1..366 or 0..365?)
+	($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) =
+	      localtime(mktime(0, 0, 12, 1, 0, 101));
+	$ydoffs = (1 - $yday);
+
+	($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = localtime($segtime);
+	$yday += $ydoffs;
+	$yday = "00$yday";
+	$yday =~ s/^0+(\d\d\d)$/$1/;
+	$newname =~ s/\d\d\d$/$yday/;
+	$out .= "Received segment $segname saved as $newname\n"
+		if $segname ne $newname;
+}
+$destdir = ($errors ? $faildir : $okdir);
+$oldseg = "$destdir/$newname";
+$oldseg =~ s/\d\d\d$/[0-9][0-9][0-9]/;
+$oldseg =~ s/net_$/[Nn][Ee][Tt]_/;
+@oldsegs = glob($oldseg);
+if (!$errors && @oldsegs)
+{
+	$prev = $oldsegs[0];
+	$prev =~ s/^.*\/(net_\d+\.\d\d\d)/$1/i;
+	if ($prev eq $newname)
+	{	unlink("$destdir/$prev.old");
+		rename("$destdir/$prev", "$destdir/$prev.old");
+		$prev .= ".old";
+	}
+}
+unlink("$destdir/$newname");
+if (!$errors)
+{
+	unlink("$origdir/$segname");
+	rename($ARGV[0], "$origdir/$segname");
+	open(F, '>', "$destdir/$newname") || die "Can't open $destdir/$newname: $!\n";
+	$err = 0;
+	print F $newseg || ($err = 1);
+	close(F) || ($err = 1);
+	if ($err)
+	{	unlink("$destdir/$newname");
+		die "Can't write $destdir/$newname: $!\n";
+	}
+} else
+{	rename($ARGV[0], "$destdir/$newname") || die "Can't rename: $!\n";
+}
+$new = 0;
+if (!$errors && $prev && $diff)
+{	$out .= "\n";
+	if (open(F, '-|', "cd $destdir; $diff $prev $newname"))
+	{	while (<F>)
+		{	s/\r\n$/\n/s;
+			$out .= $_;
+			$new = 1 unless /^\s*$/;
+		}
+		close(F);
+	} else
+	{	$new = 1;
+	}
+} elsif (!$errors)
+{	$new = 1;
+}
+
+foreach (glob($oldseg))
+{	unlink($_) if $_ ne "$destdir/$newname";
+}
+unlink("$destdir/$prev");
+if (!$errors && -x $cvs && $cvsdir)
+{	$cvsname = $newname;
+	$cvsname =~ s/\d\d\d$/ok/;
+	if (open(F, '>', "$cvsdir/$cvsname"))
+	{	print F $newseg || ($err = 1);
+		close(F) || ($err = 1);
+		if ($err)
+		{	print "Can't save $cvsname: $!\n";
+			unlink("$cvsdir/$cvsname");
+			system("cd $cvsdir; $cvs up $cvsname");
+		} else
+		{	system("cd $cvsdir; $cvs -q ci -m \"\" $cvsname >/dev/null");
+		}
+	}
+}
+
+# Send report to the NC
+$net = $netfile unless $net;
+$toname = $nc{$net};
+$toname = $& if $toname =~ /^\S+/;
+$toname =~ tr/_/ /;
+$toaddr = "2:$net/$ncnode";
+$subject = "Processing $segname results";
+$sendmsg =~ s/"/\\"/g;
+eval "\$cmd = \"$sendmsg\"";
+if (open(F, '|-', $cmd))
+{	print F $out;
+	close(F);
+} else
+{	print $out;
+}
+# Send report to another NC if network number in host and filename mismatch
+if ($net != $netfile)
+{	$toname = $nc{$netfile};
+	$toname = $& if $toname =~ /^\S+/;
+	$toname =~ tr/_/ /;
+	$toaddr = "2:$netfile/$ncnode";
+	eval "\$cmd = \"$sendmsg\"";
+	if (open(F, '|-', $cmd))
+	{	print F $out;
+		close(F);
+	}
+}
+# Send report to RC
+if ($myaddr =~ m#^(\S+)\s+([0-9:/.]+)\s*$#)
+{	($toname, $toaddr) = ($1, $2);
+	$toname =~ tr/_ / /;
+	eval "\$cmd = \"$sendmsg\"";
+	if (open(F, '|-', $cmd))
+	{	print F $out;
+		close(F);
+	}
+}
+# Send report to email if needed
+$destaddr = $nc{$net};
+$destaddr =~ s/^\S+\s*//;
+if ($net != $netfile)
+{	$ncname = $nc{$netfile};
+	$ncname =~ s/^\S+\s*//;
+	$destaddr .= " $ncname" if $ncname =~ /\@/;
+}
+if ("$destaddr$myemail" =~ /\@/ && open(F, '|-', "$sendmail $destaddr $myemail"))
+{	print F "From: $rcaddr\n";
+	$destaddr =~ s/\s+/, /g;
+	$myemail =~ s/\s+/, /g;
+	print F "To: " . ($destaddr ? $destaddr : $myemail) . "\n";
+	print F "Subject: $subject\n\n";
+	print F $out;
+	close(F);
+}
+
+if ($new && $newsegflag)
+{	open(F, '>', $newsegflag) && close(F);
+}
+
+exit($errors ? 1 : 0);
+
+sub error
+{	my ($line) = @_;
+	$line =~ s/\r\n/\n/s;
+	$out .= "Error: $line";
+	$errors++;
+}
+
+sub warning
+{	my ($line) = @_;
+	$line =~ s/\r\n/\n/s;
+	$out .= "Warning: $line";
+	$warnings++;
+}
+
+sub getdom
+{	my ($flag, $opt, $net) = @_;
+
+	if ($flag =~ /M$/)
+	{	return "n$net.z2.fidonet.$opt";
+	} elsif ($flag =~ /[43]$/)
+	{	return "n$net.z2.$opt";
+	} elsif ($flag =~ /2$/)
+	{	return "n$net.$opt";
+	} elsif ($flag =~ /1$/)
+	{	return "$opt";
+	} else
+	{	die "Internal error in getdom() function";
+	}
+}
