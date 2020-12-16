@@ -549,7 +549,7 @@ while (<F>)
 		}
 	}
 	if ($ipnode && $resolve && !$warnresolve)
-	{	if ($flag{"INA"} =~ /\./)
+	{	if ($flag{"INA"} =~ /[.:]/)
 		{	$host = $flag{"INA"};
 		} elsif ($phone =~ /^000-(\d+)-(\d+)-(\d+)-(\d+)$/ && "$1$2$3$4" =~ /[1-9]/)
 		{	$host = $phone;
