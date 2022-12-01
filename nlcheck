@@ -1,8 +1,29 @@
 #! /usr/bin/perl
+use warnings;
+use strict;
+
+our ($home);
+our ($okdir, $faildir, $origdir);
+our ($resolve, $checkmx, $checkhold);
+our ($holddb);
+our ($checkonly, $maxlinelen);
+our ($regdom, $newsegflag);
+our ($cvsdir, $cvs, $diff);
+our ($sendmsg, $sendmail, $myemail, $rcaddr);
+our $myaddr = "";
+our @flags;
+our (%implies, %softimplies, $speeds);
+our ($ipprefix, $ipflags);
+our ($requiredprefix, %requiredprefix, $phonelen, %phonelen);
+our (%phoneprefix, %nc);
+our ($rpk, $rec, $legalpvt, $twits);
+our $defdomain;
 
 require "/var/fnet/rc/nlcheck.conf";
 
 use POSIX;
+
+my ($openmode, $openmodec);
 
 if ($checkhold)
 {
@@ -47,19 +68,18 @@ if ($checkmx)
 {	eval '
 sub checkdomain
 {	my ($domain) = @_;
-	my ($res, @mxlist, @res);
 
-	if (@res = gethostbyname($host))
+	if (my @res = gethostbyname($domain))
 	{	return 1; # host exists
 	}
 	if ($? == 2)
 	{	return 2; # nameserver fail
 	}
 
-	$res = new Net::DNS::Resolver;
-	@mxlist = mx($res, $domain);
+	my $res = new Net::DNS::Resolver;
+	my @mxlist = mx($res, $domain);
 	return 1 if @mxlist;
-	$err = $res->errorstring;
+	my $err = $res->errorstring;
 	if ($err eq "SERVFAIL" ||
 	    $err eq "REFUSED" ||
 	    $err eq "NOTAUTH" ||
@@ -69,6 +89,7 @@ sub checkdomain
 	}
 	return 0;	# no MX, no addr
 }';
+	die $@ if $@;
 } else
 {	eval 'sub checkdomain { return 1; }';
 }
@@ -77,24 +98,24 @@ unless ($resolve)
 {	eval 'sub gethostbyname { return 1; }';
 }
 
-$net = 0;
-$nodes = 0;
-$crlf = 0;
-$line = 0;
-$errors = $warnings = 0;
-$lastnode = $lasthub = 0;
-$warnorder = $warnmodem = $warnzmh = $warnresolve = $warnemail = 0;
-$warnnpk = $warnnec = 0;
-$firstline = 1;
-$netdomain = $defdomain;
+my $net = 0;
+my $nodes = 0;
+my $crlf = 0;
+my $line = 0;
+my $errors = my $warnings = 0;
+my $lastnode = my $lasthub = 0;
+my $warnorder = my $warnmodem = my $warnzmh = my $warnresolve = my $warnemail = 0;
+my $warnnpk = my $warnnec = 0;
+my $firstline = 1;
+my $netdomain = $defdomain;
 
 unless ($ARGV[0] =~ /^(?:.*\/)?net_(\d+)\.\d\d\d$/i)
 {	print "Usage: $0 <segment> [check]\n";
 	exit(3);
 }
-$netfile = $1;
+my $netfile = $1;
 
-@crc16tab = (
+my @crc16tab = (
   0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
   0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
   0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
@@ -129,12 +150,21 @@ $netfile = $1;
   0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
 );
 
-@twits = split(/\s*(?:#[^\n]*)?\n\s*/, $twits);
+my @twits = split(/\s*(?:#[^\n]*)?\n\s*/, $twits // "");
+my @legalpvt = split(/\s*(?:#[^\n]*)?\n\s*/, $legalpvt // "");
 
-open(F, '<:raw', $ARGV[0]) || die "Can't open $ARGV[0]: $!\n";
-$newseg = '';
+open(my $fseg, '<:raw', $ARGV[0]) || die "Can't open $ARGV[0]: $!\n";
+my $newseg = '';
+my $phoneprefix = '';
+my ($crc, $origcrc);
+my $changed;
+my ($ncname, $ncnode, $wrongnc);
+my %node;
+my %phone;
+my %keyword;
+my ($wasunc, $wasnpk, $wasnec);
 
-while (<F>)
+while (<$fseg>)
 {
 	$line++;
 	last if $_ eq "\x1a"; # EOF
@@ -143,7 +173,7 @@ while (<F>)
 		$origcrc =~ s/^0+//;
 		$crc = 0;
 	} elsif (defined($origcrc))
-	{	foreach $char (split(//, $_))
+	{	foreach my $char (split(//, $_))
 		{	$crc = (($crc << 8) ^ $crc16tab[($crc >> 8) ^ ord($char)]) & 0xffff;
 		}
 	}
@@ -200,7 +230,7 @@ while (<F>)
 	$warnresolve-- if $warnresolve;
 	$warnemail-- if $warnemail;
 	if (/^(.*\S)\s+\r\n$/s)
-	{	$new_ = "$1\r\n";
+	{	my $new_ = "$1\r\n";
 		warning("Trailing space removed in line $line:\n$_");
 		$_ = $new_;
 		$changed = 1;
@@ -210,7 +240,7 @@ while (<F>)
 		next;
 	}
 	if (/,(\s*)$/s)
-	{	$new_ = "$`$1";
+	{	my $new_ = "$`$1";
 		warning("Trailing comma removed in line $line:\n$_");
 		$_ = $new_;
 		$changed = 1;
@@ -219,8 +249,8 @@ while (<F>)
 	{	error("can't parse line $line:\n$_");
 		next;
 	}
-	$lchanged = 0;
-	($keyword, $node, $system, $location, $sysop, $phone, $speed, $flags) = 
+	my $lchanged = 0;
+	my ($keyword, $node, $system, $location, $sysop, $phone, $speed, $flags) =
 		($1, $2, $3, $4, $5, $6, $7, $8);
 	unless ($keyword =~ /^(Host|Hub|Hold|Down|Pvt|)$/)
 	{	error("unknown keyword $keyword in line $line:\n$_");
@@ -230,7 +260,7 @@ while (<F>)
 	{	error("incorrect node number in line $line:\n$_");
 		next;
 	}
-	foreach $twit (@twits)
+	foreach my $twit (@twits)
 	{	if ($twit eq "$net/$node")
 		{	error("Node 2:$net/$node was excommunicated\n");
 			next;
@@ -252,7 +282,7 @@ while (<F>)
 	unless ($speed =~ /^$speeds$/)
 	{	error("incorrect speed \"$speed\" in line $line:\n$_");
 		next;
-	}	
+	}
 	if ($keyword eq "Host" && $net)
 	{	error("second host in line $line:\n$_");
 	}
@@ -290,10 +320,10 @@ while (<F>)
 	}
 	if ($phone =~ /\d/ && $phone !~ /^$ipprefix/)
 	{
-		$ph = $phone;
+		my $ph = $phone;
 		$ph =~ s/\D//g;
-		if (length($ph) != $phonelen)
-		{	error("incorrect phone length in line $line (must be $phonelen, real ".length($ph)."):\n$_");
+		if (!match_length(length($ph), $phonelen))
+		{	error("incorrect phone length in line $line (real ".length($ph)."):\n$_");
 		}
 		if ($phone !~ /^$requiredprefix/)
 		{	error("incorrect phone prefix in line $line:\n$_");
@@ -317,20 +347,20 @@ while (<F>)
 		$flags =~ s/,U$//;
 		$lchanged = 1;
 	}
-	$userflag = 0;
-	%flag = ();
-	@f = split(/,/, $flags);
-	$fchanged = 0;
-	$wasxflag = 0;
-	$wasemail = 0;
-	$ipnode = 0;
-	undef($hostdom);
-	foreach $f (@f)
+	my $userflag = 0;
+	my %flag;
+	my @f = split(/,/, $flags);
+	my $fchanged = 0;
+	my $wasxflag = 0;
+	my $wasemail = 0;
+	my $ipnode = 0;
+	my $hostdom;
+	foreach my $f (@f)
 	{
 		if ($f =~ /^[A-Z0-9]*[a-z]/)
 		{	unless ($f =~ /^U?T/)
 			{	if ($f =~ /^([A-Za-z0-9]+)/)
-				{	($f1, $f2) = ($&, $');
+				{	my ($f1, $f2) = ($&, $');
 					$f1 =~ tr/a-z/A-Z/;
 					warning("flag $f changed to $f1$f2 in line $line:\n$_");
 					$f="$f1$f2";
@@ -338,7 +368,7 @@ while (<F>)
 				}
 			}
 		}
-		$flag = $f;
+		my $flag = $f;
 		if ($flag =~ /^U/)
 		{	error("two U flags in one line $line:\n$_")
 				if $userflag;
@@ -347,8 +377,8 @@ while (<F>)
 			next if $flag eq "";
 		}
 		$flag = "U$flag" if $userflag;
-		$correctflag = 0;
-		foreach $lflag (@flags)
+		my $correctflag = 0;
+		foreach my $lflag (@flags)
 		{	$correctflag = 1 if $flag =~ /^$lflag$/;
 		}
 		if ($correctflag == 0)
@@ -359,7 +389,7 @@ while (<F>)
 			{	warning("No email in $flag flag specified in line $line:\n$_");
 			} elsif ($flag =~ /:/)
 			{	$wasemail = 1;
-				$email = $';
+				my $email = $';
 				if ($email !~ /^[a-zA-Z0-9_\-\.\+\!]+\@([a-zA-Z][a-zA-Z0-9\-\._]*\.[a-zA-Z]+)$/)
 				{	warning("Incorrect email address in flag $flag in line $line:\n$_");
 				} elsif (!$warnresolve && $checkmx)
@@ -369,6 +399,7 @@ while (<F>)
 				}
 			}
 		}
+		my $optflag;
 		if ($flag =~ /:/)
 		{	($flag, $optflag) = ($`, $');
 		} else
@@ -379,8 +410,8 @@ while (<F>)
 		}
 		$ipnode = 1 if $flag =~ /^($ipflags)$/;
 		if ($flag =~ /^T([a-xA-X])([a-xA-X])$/)
-		{	($startc, $endc) = ($1, $2);
-			$worktime = "0${1}00-0${2}00";
+		{	my ($startc, $endc) = ($1, $2);
+			my $worktime = "0${1}00-0${2}00";
 			$worktime =~ s/([a-x])00/${1}30/g;
 			$worktime =~ tr/a-x/A-X/;
 			$worktime =~ tr/K-T/0-9/;
@@ -388,11 +419,11 @@ while (<F>)
 			$worktime =~ tr/U-X/0-3/;
 			$worktime =~ s/0(\d\d\d)/2$1/g;
 			$worktime =~ tr/A-J/0-9/;
-			$start="0000"; $end="2330";
+			my $start="0000"; my $end="2330";
 			($start, $end) = ($1, $2) if $worktime =~ /^(\d\d\d\d)-(\d\d\d\d)$/;
 			$start =~ s/^0+//;
 			$end =~ s/^0+//;
-			$nozmh = 0;
+			my $nozmh = 0;
 			if ($start <= $end)
 			{	$nozmh = 1 if ($start > 230 || $end < 330);
 			} else
@@ -407,14 +438,16 @@ while (<F>)
 				if ($endc =~ /^[cD]$/ && $startc !~ /^[dD]$/)
 				{	$endc = 'd';
 				}
-				$proptime = "T$startc$endc";
+				my $proptime = "T$startc$endc";
 				$proptime = "CM" if $flag =~ /^T[dD][cD]$/;
 				warning("Flag $flag (worktime $worktime GMT) does not cover ZMH" . ($proptime eq $flag ? "" : " (should be $proptime?)") . " in line $line:\n$_");
 			}
 			$flag = "T";
 		}
 		if (defined($flag{$flag}))
-		{	error("Two $flag flags in line $line:\n$_");
+		{	if ($flag ne 'INA' || $flag{$flag} eq $optflag) {
+                error("Two $flag flags in line $line:\n$_");
+            }
 		} else
 		{	$flag{$flag} = $optflag;
 			if ($flag =~ /^X[ABCPRWX]$/)
@@ -434,20 +467,20 @@ while (<F>)
 	if ($phone =~ /^$ipprefix/ && !$flag{"IBN"})
 	{	warning("IP phone prefix $ipprefix without IBN flag in line $line:\n$_");
 	}
-	foreach $flag (keys %implies)
+	foreach my $flag (keys %implies)
 	{	next unless $flag{$flag};
-		foreach $impflag (split(/\s+/, $implies{$flag}))
+		foreach my $impflag (split(/\s+/, $implies{$flag}))
 		{	next unless $flag{$impflag};
 			error("$flag implies $impflag in line $line:\n$_");
 		}
 	}
-	foreach $flag (keys %implies)
+	foreach my $flag (keys %implies)
 	{	next unless $flag{$flag};
-		foreach $impflag (split(/\s+/, $implies{$flag}))
+		foreach my $impflag (split(/\s+/, $implies{$flag}))
 		{	$flag{$impflag} = 1;
 		}
 	}
-	$ufchanged = 0;
+	my $ufchanged = 0;
 	if ($flag{"UREC"} && "$net/$node" ne $rec)
 	{	warning("Unapproved UREC flag removed in line $line:\n$_");
 		$ufchanged=1;
@@ -515,9 +548,9 @@ while (<F>)
 	{	warning("Speed $speed without V34 in line $line:\n$_");
 	}
 	unless ($warnmodem)
-	{	foreach $flag (keys %softimplies)
+	{	foreach my $flag (keys %softimplies)
 		{	next unless $flag{$flag};
-			foreach $impflag (split(/\s+/, $softimplies{$flag}))
+			foreach my $impflag (split(/\s+/, $softimplies{$flag}))
 			{	next if $flag{$impflag};
 				warning("$flag without $impflag in line $line:\n$_");
 			}
@@ -534,7 +567,7 @@ while (<F>)
 		$phone = "-Unpublished-";
 		$lchanged = 1;
 	}
-	if ($phone =~ /^000[-0]+$/ && $ipnode)
+	if ($phone =~ /^00[-0]+$/ && $ipnode)
 	{	warning("zero phone changed to unpublished for IP-node in line $line:\n$_");
 		$phone = "-Unpublished-";
 		$lchanged = 1;
@@ -549,7 +582,8 @@ while (<F>)
 		}
 	}
 	if ($ipnode && $resolve && !$warnresolve)
-	{	if ($flag{"INA"} =~ /[.:]/)
+	{	my $host;
+		if ($flag{"INA"} && $flag{"INA"} =~ /[.:]/)
 		{	$host = $flag{"INA"};
 		} elsif ($phone =~ /^000-(\d+)-(\d+)-(\d+)-(\d+)$/ && "$1$2$3$4" =~ /[1-9]/)
 		{	$host = $phone;
@@ -594,7 +628,7 @@ while (<F>)
 	}
 	$newseg .= $_;
 }
-close(F);
+close($fseg);
 
 if (defined($wrongnc))
 {	error("Unapproved NC: expected $ncname, found $wrongnc\n");
@@ -612,13 +646,14 @@ if (defined($origcrc) && $crc != $origcrc)
 {	error(sprintf("CRC check failed: specified %05d, calculated %05d\n", $origcrc, $crc));
 }
 
-$curtime = time();
+my $curtime = time();
 # segtime = 1:00 AM of Friday
-($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = localtime($curtime - 3600);
-$segtime = $curtime + 24 * 3600 * (1 + (11 - $wday) % 7);
+my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = localtime($curtime - 3600);
+my $segtime = $curtime + 24 * 3600 * (1 + (11 - $wday) % 7);
 ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = localtime($segtime - 3600);
 $segtime -= $hour * 3600 + $min * 60 + $sec;
 
+my %holddb;
 if ($checkhold)
 {	unless (tie(%holddb, $checkhold, $holddb, $openmode, 0644) ||
 	        tie(%holddb, $checkhold, $holddb, $openmodec, 0644))
@@ -627,7 +662,7 @@ if ($checkhold)
 	}
 }
 if ($checkhold)
-{	foreach $node (keys %keyword)
+{	foreach my $node (keys %keyword)
 	{	if ($keyword{$node} eq "Hold")
 		{	if ($holddb{"$net/$node"} =~ /^Hold /)
 			{	if ($segtime - $' >= 24 * 60 * 60 * 8)
@@ -658,24 +693,25 @@ if ($checkhold)
 	untie %holddb;
 }
 
+my $out = "";
 $out .= "\nDone, $warnings warnings, $errors errors, $nodes nodes\n";
 $out .= ($errors ? "FAILED" : ("OK" . (defined($origcrc) ? " (crc check passed)" : ""))) . "\n";
 
-if ($checkonly || $ARGV[1] =~ /^check$/i)
+if ($checkonly || ($ARGV[1] && $ARGV[1] =~ /^check$/i))
 {
 	print $out;
 	exit($errors ? 1 : 0);
 }
 
-$segname = $ARGV[0];
+my $segname = $ARGV[0];
 $segname =~ s/^.*\/(net_\d+\.\d\d\d)/$1/i;
-$newname = $segname;
+my $newname = $segname;
 $newname =~ tr/A-Z/a-z/;
 if (!$errors)
 {	# check $yday range (1..366 or 0..365?)
 	($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) =
 	      localtime(mktime(0, 0, 12, 1, 0, 101));
-	$ydoffs = (1 - $yday);
+	my $ydoffs = (1 - $yday);
 
 	($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = localtime($segtime);
 	$yday += $ydoffs;
@@ -685,11 +721,12 @@ if (!$errors)
 	$out .= "Received segment $segname saved as $newname\n"
 		if $segname ne $newname;
 }
-$destdir = ($errors ? $faildir : $okdir);
-$oldseg = "$destdir/$newname";
+my $destdir = ($errors ? $faildir : $okdir);
+my $oldseg = "$destdir/$newname";
 $oldseg =~ s/\d\d\d$/[0-9][0-9][0-9]/;
 $oldseg =~ s/net_$/[Nn][Ee][Tt]_/;
-@oldsegs = glob($oldseg);
+my @oldsegs = glob($oldseg);
+my $prev;
 if (!$errors && @oldsegs)
 {
 	$prev = $oldsegs[0];
@@ -705,10 +742,10 @@ if (!$errors)
 {
 	unlink("$origdir/$segname");
 	rename($ARGV[0], "$origdir/$segname");
-	open(F, '>', "$destdir/$newname") || die "Can't open $destdir/$newname: $!\n";
-	$err = 0;
-	print F $newseg || ($err = 1);
-	close(F) || ($err = 1);
+	open(my $fh, '>', "$destdir/$newname") || die "Can't open $destdir/$newname: $!\n";
+	my $err = 0;
+	print $fh $newseg || ($err = 1);
+	close($fh) || ($err = 1);
 	if ($err)
 	{	unlink("$destdir/$newname");
 		die "Can't write $destdir/$newname: $!\n";
@@ -716,16 +753,17 @@ if (!$errors)
 } else
 {	rename($ARGV[0], "$destdir/$newname") || die "Can't rename: $!\n";
 }
-$new = 0;
+my $new = 0;
 if (!$errors && $prev && $diff)
 {	$out .= "\n";
-	if (open(F, '-|', "cd $destdir; $diff $prev $newname"))
-	{	while (<F>)
+	if (open(my $f, '-|', "cd $destdir && $diff $prev $newname"))
+	{
+		while (<$f>)
 		{	s/\r\n$/\n/s;
 			$out .= $_;
 			$new = 1 unless /^\s*$/;
 		}
-		close(F);
+		close($f);
 	} else
 	{	$new = 1;
 	}
@@ -737,12 +775,13 @@ foreach (glob($oldseg))
 {	unlink($_) if $_ ne "$destdir/$newname";
 }
 unlink("$destdir/$prev");
-if (!$errors && -x $cvs && $cvsdir)
-{	$cvsname = $newname;
+if (!$errors && $cvs && -x $cvs && $cvsdir)
+{	my $cvsname = $newname;
 	$cvsname =~ s/\d\d\d$/ok/;
-	if (open(F, '>', "$cvsdir/$cvsname"))
-	{	print F $newseg || ($err = 1);
-		close(F) || ($err = 1);
+	my $err;
+	if (open(my $fh, '>', "$cvsdir/$cvsname"))
+	{	print $fh $newseg || ($err = 1);
+		close($fh) || ($err = 1);
 		if ($err)
 		{	print "Can't save $cvsname: $!\n";
 			unlink("$cvsdir/$cvsname");
@@ -755,16 +794,17 @@ if (!$errors && -x $cvs && $cvsdir)
 
 # Send report to the NC
 $net = $netfile unless $net;
-$toname = $nc{$net};
+my $toname = $nc{$net};
 $toname = $& if $toname =~ /^\S+/;
 $toname =~ tr/_/ /;
-$toaddr = "2:$net/$ncnode";
-$subject = "Processing $segname results";
+my $toaddr = "2:$net/$ncnode";
+my $subject = "Processing $segname results";
 $sendmsg =~ s/"/\\"/g;
+my $cmd;
 eval "\$cmd = \"$sendmsg\"";
-if (open(F, '|-', $cmd))
-{	print F $out;
-	close(F);
+if (open(my $fh, '|-', $cmd))
+{	print $fh $out;
+	close($fh);
 } else
 {	print $out;
 }
@@ -775,9 +815,9 @@ if ($net != $netfile)
 	$toname =~ tr/_/ /;
 	$toaddr = "2:$netfile/$ncnode";
 	eval "\$cmd = \"$sendmsg\"";
-	if (open(F, '|-', $cmd))
-	{	print F $out;
-		close(F);
+	if (open(my $fh, '|-', $cmd))
+	{	print $fh $out;
+		close($fh);
 	}
 }
 # Send report to RC
@@ -785,31 +825,33 @@ if ($myaddr =~ m#^(\S+)\s+([0-9:/.]+)\s*$#)
 {	($toname, $toaddr) = ($1, $2);
 	$toname =~ tr/_ / /;
 	eval "\$cmd = \"$sendmsg\"";
-	if (open(F, '|-', $cmd))
-	{	print F $out;
-		close(F);
+	if (open(my $fh, '|-', $cmd))
+	{	print $fh $out;
+		close($fh);
 	}
 }
 # Send report to email if needed
-$destaddr = $nc{$net};
+my $destaddr = $nc{$net};
 $destaddr =~ s/^\S+\s*//;
 if ($net != $netfile)
 {	$ncname = $nc{$netfile};
 	$ncname =~ s/^\S+\s*//;
 	$destaddr .= " $ncname" if $ncname =~ /\@/;
 }
-if ("$destaddr$myemail" =~ /\@/ && open(F, '|-', "$sendmail $destaddr $myemail"))
-{	print F "From: $rcaddr\n";
+if ("$destaddr$myemail" =~ /\@/ && open(my $fh, '|-', "$sendmail $destaddr $myemail"))
+{	print $fh "From: $rcaddr\n";
 	$destaddr =~ s/\s+/, /g;
 	$myemail =~ s/\s+/, /g;
-	print F "To: " . ($destaddr ? $destaddr : $myemail) . "\n";
-	print F "Subject: $subject\n\n";
-	print F $out;
-	close(F);
+	print $fh "To: " . ($destaddr ? $destaddr : $myemail) . "\n";
+	print $fh "Subject: $subject\n\n";
+	print $fh $out;
+	close($fh);
 }
 
 if ($new && $newsegflag)
-{	open(F, '>', $newsegflag) && close(F);
+{	if (open(my $fh, '>', $newsegflag)) {
+		close($fh);
+	}
 }
 
 exit($errors ? 1 : 0);
@@ -841,5 +883,15 @@ sub getdom
 	{	return "$opt";
 	} else
 	{	die "Internal error in getdom() function";
+	}
+}
+
+sub match_length
+{
+	my ($len, $check) = @_;
+	if (ref $check eq 'ARRAY') {
+		return grep { $_ == $len } @$check;
+	} else {
+		return $check == $len;
 	}
 }
