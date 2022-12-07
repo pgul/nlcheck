@@ -774,7 +774,7 @@ if (!$errors && $prev && $diff)
 foreach (glob($oldseg))
 {	unlink($_) if $_ ne "$destdir/$newname";
 }
-unlink("$destdir/$prev");
+unlink("$destdir/$prev") if $prev;
 if (!$errors && $cvs && -x $cvs && $cvsdir)
 {	my $cvsname = $newname;
 	$cvsname =~ s/\d\d\d$/ok/;
