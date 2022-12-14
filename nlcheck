@@ -163,6 +163,7 @@ my %node;
 my %phone;
 my %keyword;
 my ($wasunc, $wasnpk, $wasnec);
+my $out = "";
 
 while (<$fseg>)
 {
@@ -693,7 +694,6 @@ if ($checkhold)
 	untie %holddb;
 }
 
-my $out = "";
 $out .= "\nDone, $warnings warnings, $errors errors, $nodes nodes\n";
 $out .= ($errors ? "FAILED" : ("OK" . (defined($origcrc) ? " (crc check passed)" : ""))) . "\n";
 
