@@ -253,6 +253,7 @@ while (<$fseg>)
 	my $lchanged = 0;
 	my ($keyword, $node, $system, $location, $sysop, $phone, $speed, $flags) =
 		($1, $2, $3, $4, $5, $6, $7, $8);
+	$flags //= "";
 	unless ($keyword =~ /^(Host|Hub|Hold|Down|Pvt|)$/)
 	{	error("unknown keyword $keyword in line $line:\n$_");
 		next;
